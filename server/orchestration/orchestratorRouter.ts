@@ -16,8 +16,10 @@ import { feedbackLoop } from "./feedbackLoop";
 import { getSystemSnapshot } from "../organs/organMetrics";
 import { worldThinkingEngine } from "./worldThinkingEngine";
 import { orchestrationOversight } from "./orchestrationOversight";
+import { autonomousHomeRouter } from "./autonomousHomeRouter";
 
 export const orchestratorRouter = Router();
+orchestratorRouter.use("/", autonomousHomeRouter);
 
 orchestratorRouter.post("/output/ack", async (req,res) => {
   try {

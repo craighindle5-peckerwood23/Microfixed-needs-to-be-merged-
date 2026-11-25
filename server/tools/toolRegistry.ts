@@ -234,6 +234,43 @@ export const TOOL_REGISTRY: ToolDefinition[] = [
     },
     organ: "orchestration_oversight", action: "emergency_kill",
   },
+  // ── Universal App Connectors & External MCP ───────────────────────────
+  {
+    name: "list_app_connectors",
+    description: "List installed external app APIs, webhooks, GraphQL endpoints, and MCP servers configured for this tenant.",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+    organ: "system_catalog", action: "list_connectors",
+  },
+  {
+    name: "discover_mcp_server",
+    description: "Discover available tools from a remote HTTPS Model Context Protocol (MCP) server via JSON-RPC.",
+    parameters: {
+      type: "object",
+      properties: {
+        base_url: { type: "string", description: "HTTPS URL of the remote MCP server" },
+      },
+      required: ["base_url"],
+    },
+    organ: "system_catalog", action: "discover_mcp",
+  },
+  {
+    name: "call_app_connector",
+    description: "Invoke a tool on an enabled external app connector (REST, GraphQL, Webhook, or remote MCP server).",
+    parameters: {
+      type: "object",
+      properties: {
+        connector_id: { type: "string", description: "Installed connector ID" },
+        tool_name: { type: "string", description: "Tool name declared on the connector" },
+        arguments_json: { type: "string", description: "JSON object of tool arguments" },
+      },
+      required: ["connector_id", "tool_name", "arguments_json"],
+    },
+    organ: "system_catalog", action: "call_connector",
+  },
 ];
 
 export function getTool(name: string): ToolDefinition | undefined {

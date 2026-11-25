@@ -27,7 +27,21 @@ const HOST = "0.0.0.0";
 
 export const app = express();
 export const server = http.createServer(app);
-export const wss = new WebSocketServer({ server, path: "/ws" });
+export const wss = new WebSocketServer({ noServer: true });
+
+import { attachLiveVisionVoiceBridge } from "./realtime/liveVisionVoiceBridge";
+const liveWss = attachLiveVisionVoiceBridge(server);
+
+server.on("upgrade", (req, socket, head) => {
+  const reqUrl = req.url || "";
+  if (reqUrl === "/ws" || reqUrl.startsWith("/ws?")) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+    });
+  } else if (!(reqUrl === "/ws/live" || reqUrl.startsWith("/ws/live?"))) {
+    socket.destroy();
+  }
+});
 
 type LazyHandler = () => Promise<RequestHandler>;
 function lazyRouter(load: LazyHandler): RequestHandler {
@@ -436,6 +450,19 @@ app.use("/api/learning", lazyRouter(async () => {
   const { learningRouter } = await import("./routes/learningRoutes");
   return learningRouter;
 }));
+app.use("/api/realtime", lazyRouter(async () => {
+  const { realtimeRouter } = await import("./realtime/realtimeRouter");
+  return realtimeRouter;
+}));
+app.use("/api/decisions", lazyRouter(async () => {
+  await ensureMemoryTransport();
+  const { autonomousHomeRouter } = await import("./orchestration/autonomousHomeRouter");
+  const { Router } = await import("express");
+  const r = Router();
+  r.get("/pending", (req, res, next) => { req.url = "/decisions/pending"; autonomousHomeRouter(req, res, next); });
+  r.post("/resolve", (req, res, next) => { req.url = "/decisions/resolve"; autonomousHomeRouter(req, res, next); });
+  return r;
+}));
 
 app.get("/api/groq/status", async (_, res) => {
   const { groqConfiguration } = await import("./orchestration/groqRuntime");
@@ -605,8 +632,9 @@ if (
 ) {
   server.listen(PORT, HOST, () => {
     console.log("\n🧠 Microfixd Backend Server");
-    console.log(`   REST: http://${HOST}:${PORT}/api`);
-    console.log(`   WS:   ws://${HOST}:${PORT}/ws`);
+    console.log(`   REST:    http://${HOST}:${PORT}/api`);
+    console.log(`   WS:      ws://${HOST}:${PORT}/ws`);
+    console.log(`   WS LIVE: ws://${HOST}:${PORT}/ws/live (${liveWss.clients.size} clients)`);
     console.log("   Bootstrap: live; operational modules lazy-loaded on demand\n");
   });
 

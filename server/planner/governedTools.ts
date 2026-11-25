@@ -21,9 +21,11 @@ import {rememberKnowledge} from '../memory/knowledgeMemory';
 import {enqueueSourceIncident} from '../engineering/repairIncidents';
 import {readCompletedRepair,repairRecoveryResult} from '../engineering/repairRecovery';
 import {liveCapabilityLedger} from '../runtime/liveCapabilities';
+import {listConnectors} from '../plugins/pluginRegistry';
+import {discoverRemoteMcpTools,executeConnectorTool} from '../plugins/connectorExecutor';
 export const ENABLED_TOOLS=TOOL_REGISTRY.map(tool=>tool.name);
 export const BROWSER_TOOLS=new Set(['run_browser_workflow','inspect_browser_page','navigate_browser','scrape_url','take_screenshot','click_element','crawl_website']);
-export const READ_TOOLS=new Set(['search_vehicle_catalog','search_vehicle_references','list_workflow_skills','read_mission_artifact','search_mission_history','recall_knowledge','recall_procedures','obd_connection_setup','list_obd_sessions','read_obd_status','list_automotive_cases','read_automotive_case','list_system_capabilities','probe_system_organ','run_live_capability_probe','metacognitive_multi_domain_reason','retrospect_inception_to_outcome','read_public_page','get_github_repo','scan_for_security_issues']);
+export const READ_TOOLS=new Set(['search_vehicle_catalog','search_vehicle_references','list_workflow_skills','read_mission_artifact','search_mission_history','recall_knowledge','recall_procedures','obd_connection_setup','list_obd_sessions','read_obd_status','list_automotive_cases','read_automotive_case','list_system_capabilities','probe_system_organ','run_live_capability_probe','metacognitive_multi_domain_reason','retrospect_inception_to_outcome','list_app_connectors','discover_mcp_server','read_public_page','get_github_repo','scan_for_security_issues']);
 export function requestHash(value:JSONValue):string {
  const canonical=(v:JSONValue):string=>Array.isArray(v)?`[${v.map(canonical).join(',')}]`:v&&typeof v==='object'?`{${Object.keys(v).sort().map(k=>`${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`:JSON.stringify(v);
  return createHash('sha256').update(canonical(value)).digest('hex');
@@ -131,6 +133,17 @@ export function createGovernedTools(client:SupabaseClient,tenant:string,mission:
   else if(name==='run_live_capability_probe'){
    const requestedMode=(args as JSONObject).mode==='deep'?'deep':'quick';
    raw=JSON.parse(JSON.stringify(await liveCapabilityLedger.runSweep({mode:requestedMode,tenantId:tenant})));
+  }
+  else if(name==='list_app_connectors'){
+   raw=JSON.parse(JSON.stringify({connectors:listConnectors(tenant).map(c=>({id:c.manifest.id,name:c.manifest.name,transport:c.manifest.transport,category:c.manifest.category??'custom',baseUrl:c.manifest.baseUrl,enabled:c.enabled,tools:c.manifest.tools.map(t=>({name:t.name,description:t.description??'',risk:t.risk??'read'}))}))}));
+  }
+  else if(name==='discover_mcp_server'){
+   raw=JSON.parse(JSON.stringify(await discoverRemoteMcpTools({baseUrl:String((args as JSONObject).base_url)})));
+  }
+  else if(name==='call_app_connector'){
+   const parsedArgs=JSON.parse(String((args as JSONObject).arguments_json||'{}'));
+   if(!parsedArgs||typeof parsedArgs!=='object'||Array.isArray(parsedArgs))throw new Error('INVALID_CONNECTOR_ARGUMENTS');
+   raw=JSON.parse(JSON.stringify(await executeConnectorTool(String((args as JSONObject).connector_id),String((args as JSONObject).tool_name),parsedArgs,tenant)));
   }
   else {
    const structured=['remember_knowledge','recall_knowledge','recall_procedures'].includes(name);
