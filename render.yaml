@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: microfixd-full-ai
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 22.17.0
+      - key: NODE_ENV
+        value: production
+      # Add these in the Render dashboard (Environment tab) rather than
+      # committing real values here:
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: OPERATOR_TOKEN
+        sync: false
+      - key: SYSTEM_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: BRAIN_MAX_TOKENS
+        value: "10000"
+      - key: RESPONSE_MAX_TOKENS
+        value: "10000"
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+    healthCheckPath: /api/health

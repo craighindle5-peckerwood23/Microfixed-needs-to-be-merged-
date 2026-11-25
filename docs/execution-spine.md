@@ -1,0 +1,56 @@
+# Durable execution spine v1
+
+Mission Control submits tenant-scoped missions to `/api/planner/missions` using an `Idempotency-Key`. The server worker owns execution; UI state cannot advance tasks. Storage is Supabase only.
+
+## Execution guarantees
+
+- A database lease fences all state commits, model reservations and tool starts. Workers renew leases every ten seconds.
+- Planning is committed with tasks and subtasks in one transaction. Completed steps are retained across restarts.
+- Tool effects have a durable run ledger. Completed results are reused. Uncertain effects wait for administrator reconciliation and are never automatically replayed.
+- Agent results are checkpointed before task finalization. Messages link assignments, candidates and supervisor decisions to the mission.
+- Schema, evidence and content hashes determine eligible artifacts. Arbitration is deterministic; confidence is an ordering signal, not proof of factual correctness.
+- Final assembly preserves verified artifacts without another model call.
+- Each provider attempt reserves a conservative token allowance. Reported usage settles that allowance; unknown usage and failed attempts remain charged conservatively. The budget limits future dispatch, not provider billing guarantees.
+- All protected tools require a single-use approval bound to the exact request. Browser requests also require explicitly allowed public HTTPS origins.
+- Supabase tables have RLS and no browser-role grants. Server queries carry tenant and mission predicates. Shared ops credentials address the default tenant; account credentials resolve tenant membership from profiles.
+
+## Operator controls
+
+`GET /api/planner/missions/:id` returns persisted tasks, subtasks, artifacts, messages, approvals, tool runs and budget accounting.
+
+Admin-only operations:
+
+- `POST /missions/:id/approvals/:subtask/decide`: approve or reject the exact request hash.
+- `POST /missions/:id/approvals/:subtask/renew`: renew an expired pending request.
+- `POST /missions/:id/reconcile/:subtask`: record a verified result for an uncertain action.
+- `POST /missions/:id/resume`: explicitly authorize another bounded attempt and set `max_tokens` (1–100000). Pending approvals or uncertain effects must be resolved first.
+
+## Installation and checks
+
+Apply SQL files in order: `execution_spine_schema.sql`, `execution_spine_governance.sql`, `execution_spine_hardening.sql`, `execution_spine_approval_renewal.sql`, `execution_spine_tool_contract.sql`, `execution_spine_result_invariants.sql`.
+
+`npm run test:spine` checks replay prevention, crash-boundary recovery, approvals, budget pauses, output rejection and tenant-scoped messaging. `supabase/tests/execution_spine.sql` exercises real database functions in a rolled-back transaction. `npm run build` gates deployment on regression tests and topology validation.
+
+External browser/vehicle/device capabilities remain separate adapters. Browser v1 isolates each action and navigates its explicit URL; authenticated browser sessions and arbitrary multi-step login workflows are not represented as verified capabilities.
+
+## Production verification controls
+
+Execution API writes require `execute`; observer monitoring does not grant mission submission.
+An optional ISO timestamp `deadline_at` prevents planning or new subtask attempts after expiration.
+This is a boundary deadline, not forced termination of an in-flight external action. Existing adapter timeouts remain in force.
+Expired missions wait for operator intervention; automatic resume does not extend their deadline.
+`GET /api/planner/missions/:id/audit` checks tenant/parent links, content hashes, required subtask artifacts, success completeness, policy fingerprints, and final evidence hashes.
+Historical artifacts without provenance are reported as unverifiable rather than silently upgraded.
+Hashes detect inconsistency; they are not signatures or proof against a privileged database attacker.
+
+## Provider-limit recovery
+
+Groq mission calls allow up to three bounded attempts so output quota errors can reduce `max_tokens` before retrying. Every actual dispatch reserves its own durable token allowance; budget or lease failures stop before dispatch. Failed attempts remain conservatively charged. `PROVIDERS_EXHAUSTED` reports provider failure, not proof of uninitialized organs. Restore provider availability and resume the affected mission using the existing operator control; do not flush the queue or discard completed artifacts.
+
+## Objective completion and bounded continuation
+
+New intake pins `completion_policy: objective-v1` server-side. Finishing a generated plan now triggers a separate, budgeted assessment of persisted evidence against the whole original objective. The reviewer returns `complete`, `continue`, or `blocked`, actual evidence IDs, and a concise reason. Inventory/probe output is explicitly described as discovery rather than proof of requested downstream work. Evidence previews are bounded and marked when truncated. This is a fallible model assessment, not independent factual certification.
+
+Continuation appends validated atomic tasks under the existing lease, permissions, approval policy, deadline and token budget. The review and next tasks commit together. At most two continuation rounds and sixteen total subtasks are permitted. An identical prior request/input, exhausted continuation bound, missing input, invalid response, or provider failure cannot produce mission success. Uncertain external effects still require reconciliation. Completed tools and agent outputs remain checkpointed across restarts; a persisted completion decision is reused if final assembly crashes.
+
+Caller-authored explicit plans are assessed deterministically as completed exact actions; their review states that a broader semantic objective is not certified. Generated plans receive model review. Final evidence records the assessment method, snapshot and evidence IDs; audit rejects new-policy success without a matching assessment. Historical results are not rewritten. Mission detail exposes `completion_reviews`; Mission Control shows the latest assessment and caps unfinished task progress at 99%.

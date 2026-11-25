@@ -1,0 +1,171 @@
+import {executeAutomotiveOrgan} from '../organs/organs/automotiveOrgan';
+import {createHash} from 'node:crypto';
+import type {SupabaseClient} from '@supabase/supabase-js';
+import type {JSONObject,JSONValue,ExecutionContext,ExecutionResult,Subtask} from './executionSpine';
+import {dispatchOrgan} from '../organs/dispatch';
+import {organRegistry} from '../organs/organRegistry';
+import {probeOrgan} from '../organs/probes';
+import {EXECUTORS} from '../organs/executors';
+import {TOOL_REGISTRY,getTool} from '../tools/toolRegistry';
+import {getExecutor} from '../organs/executors';
+import {publicPageURL} from '../tools/publicPageReader';
+import {BrowserManager} from '../playwright/browserManager';
+import {validateSchema} from './schema';
+import {readMissionArtifact, searchMissionHistory, saveMissionNote} from './taskContinuity';
+import {parseBrowserWorkflow,runBrowserWorkflow} from '../playwright/browserWorkflow';
+import {parseIsolatedRequest,runIsolatedCode,sandboxConfigured} from '../sandbox/isolatedCode';
+import {validateSkill,saveWorkflowSkill,listWorkflowSkills} from './workflowSkills';
+import {SPECIALISTS} from './specialists';
+import {repairSource} from '../engineering/sourceRepair';
+import {rememberKnowledge} from '../memory/knowledgeMemory';
+import {enqueueSourceIncident} from '../engineering/repairIncidents';
+import {readCompletedRepair,repairRecoveryResult} from '../engineering/repairRecovery';
+import {liveCapabilityLedger} from '../runtime/liveCapabilities';
+export const ENABLED_TOOLS=TOOL_REGISTRY.map(tool=>tool.name);
+export const BROWSER_TOOLS=new Set(['run_browser_workflow','inspect_browser_page','navigate_browser','scrape_url','take_screenshot','click_element','crawl_website']);
+export const READ_TOOLS=new Set(['search_vehicle_catalog','search_vehicle_references','list_workflow_skills','read_mission_artifact','search_mission_history','recall_knowledge','recall_procedures','obd_connection_setup','list_obd_sessions','read_obd_status','list_automotive_cases','read_automotive_case','list_system_capabilities','probe_system_organ','run_live_capability_probe','metacognitive_multi_domain_reason','retrospect_inception_to_outcome','read_public_page','get_github_repo','scan_for_security_issues']);
+export function requestHash(value:JSONValue):string {
+ const canonical=(v:JSONValue):string=>Array.isArray(v)?`[${v.map(canonical).join(',')}]`:v&&typeof v==='object'?`{${Object.keys(v).sort().map(k=>`${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`:JSON.stringify(v);
+ return createHash('sha256').update(canonical(value)).digest('hex');
+}
+export class ExecutionPause extends Error {constructor(public code:'WAITING_APPROVAL'|'RECONCILIATION_REQUIRED'){super(code);}}
+export function createGovernedTools(client:SupabaseClient,tenant:string,mission:string,owner:string,repairModel?:Parameters<typeof repairSource>[4]) {
+ const run=async(subtask:string)=>{const {data,error}=await client.from('spine_tool_runs').select('*').eq('tenant_id',tenant).eq('mission_id',mission).eq('subtask_id',subtask).maybeSingle();if(error)throw new Error(error.code);return data;};
+ const recoverTool=async(sub:Subtask,context:ExecutionContext):Promise<ExecutionResult|null>=>{
+  const prior=await run(sub.subtask_id);
+  if(!prior)return null;
+  if(context.tenant_id!==tenant||context.mission_id!==mission)throw new Error('TENANT_MISMATCH');
+  if(prior.request_hash!==requestHash(sub.tool_request))throw new Error('REQUEST_CHANGED');
+  if(prior.status!=='succeeded'){
+   if(sub.tool_request?.name==='repair_source_code'&&tenant===(process.env.MICROFIXD_REPAIR_OWNER_TENANT||'default')&&context.constraints.tool_approval_mode==='preauthorized'&&context.constraints.approval_actor){
+    const raw=await readCompletedRepair(client,{tenant,mission,subtask:context.subtask_id});
+    if(raw){const result=repairRecoveryResult(raw,tenant,context.subtask_id,prior.request_hash);const {error}=await client.rpc('spine_finish_tool',{p_tenant:tenant,p_mission:mission,p_subtask:context.subtask_id,p_owner:owner,p_hash:prior.request_hash,p_result:result});if(error)throw new Error('REPAIR_RECOVERY_COMMIT_FAILED');return result;}
+   }
+   throw new ExecutionPause('RECONCILIATION_REQUIRED');
+  }
+  return prior.result as ExecutionResult;
+ };
+ const executeTool=async(request:JSONObject,context:ExecutionContext):Promise<ExecutionResult>=>{
+  if(context.tenant_id!==tenant||context.mission_id!==mission)throw new Error('TENANT_MISMATCH');
+  const name=String(request.name),tool=getTool(name),hash=requestHash(request);
+  if(!tool||!ENABLED_TOOLS.includes(name)||!context.tool_permissions.includes(name))throw new Error('TOOL_NOT_PERMITTED');
+  const args=request.arguments;
+  if(!args||typeof args!=='object'||Array.isArray(args)||!validateSchema(args,{...tool.parameters,properties:{...tool.parameters.properties,...(BROWSER_TOOLS.has(name)?{url:{type:'string'}}:{})},required:[...new Set([...tool.parameters.required,...(BROWSER_TOOLS.has(name)?['url']:[])])],additionalProperties:false} as any))throw new Error('INVALID_TOOL_ARGUMENTS');
+  if(BROWSER_TOOLS.has(name)){
+   const url=new URL(publicPageURL(String((args as JSONObject).url??'')));
+   if(url.protocol!=='https:'||url.username||url.password||!Array.isArray(context.constraints.browser_origins)||!context.constraints.browser_origins.includes(url.origin))throw new Error('INVALID_BROWSER_URL');
+  }
+  const workflow=name==='run_browser_workflow'?parseBrowserWorkflow((args as JSONObject).workflow_json,(args as JSONObject).mode??'dom'):null;
+  const isolated=name==='run_isolated_code'?parseIsolatedRequest(args as JSONObject):null;
+  if(isolated&&!sandboxConfigured())throw new Error('ISOLATED_SANDBOX_NOT_CONFIGURED');
+  const skill=name==='save_workflow_skill'?validateSkill(JSON.parse(String((args as JSONObject).definition_json))):null;
+  let organPayload:Record<string,unknown>|undefined;
+  if(name==='invoke_system_organ'){
+   organPayload=organInvocationPayload(args as JSONObject,tenant,mission);
+  }
+  if(name==='push_file_to_github'&&!process.env.GITHUB_TOKEN?.trim())throw new Error('MISSING_GITHUB_CREDENTIALS');
+  if(name==='repair_source_code'){
+   if(tenant!==(process.env.MICROFIXD_REPAIR_OWNER_TENANT||'default')||context.constraints.tool_approval_mode!=='preauthorized'||!context.constraints.approval_actor)throw new Error('REPAIR_OWNER_ADMIN_REQUIRED');
+   if(!repairModel||!process.env.MICROFIXD_REPAIR_RUNNER_URL||!process.env.GITHUB_TOKEN)throw new Error('REPAIR_RUNNER_UNCONFIGURED');
+  }
+  const prior=await run(context.subtask_id);
+  if(prior){if(prior.request_hash!==hash)throw new Error('REQUEST_CHANGED');if(prior.status==='succeeded')return prior.result as ExecutionResult;throw new ExecutionPause('RECONCILIATION_REQUIRED');}
+  // The database's immutable allowlist contains only these three read tools.
+  // Other read tools still need an automatically recorded exact-action receipt.
+  const protectedAction=!['read_public_page','get_github_repo','scan_for_security_issues'].includes(name);
+  if(protectedAction){
+   const automatic=READ_TOOLS.has(name)||(context.constraints.tool_approval_mode==='preauthorized'&&typeof context.constraints.approval_actor==='string'&&context.constraints.approval_actor.length>0);
+   const receipt={tenant_id:tenant,mission_id:mission,subtask_id:context.subtask_id,request_hash:hash,request,
+    ...(automatic?{status:'approved',decided_by:READ_TOOLS.has(name)?'read-only-policy':String(context.constraints.approval_actor),decided_at:new Date().toISOString()}:{} )};
+   // Ignore duplicates: never overwrite an operator rejection or consumed receipt.
+   const {error}=await client.from('spine_approvals').upsert(receipt,{onConflict:'tenant_id,subtask_id,request_hash',ignoreDuplicates:true});
+   if(error)throw new Error(error.code);
+  }
+  const {data:started,error}=await client.rpc('spine_start_tool',{p_tenant:tenant,p_mission:mission,p_subtask:context.subtask_id,p_owner:owner,p_hash:hash,p_request:request,p_protected:protectedAction});
+  if(error)throw new Error(error.code);
+  if(!started)throw new ExecutionPause('WAITING_APPROVAL');
+  let raw:JSONValue;
+  try{
+  if(BROWSER_TOOLS.has(name)){
+   const browser=new BrowserManager();
+   try{const page=await browser.getPage();await page.route('**/*',route=>{let allowed=false;try{allowed=(context.constraints.browser_origins as string[]).includes(new URL(route.request().url()).origin);}catch{}return allowed?route.continue():route.abort();});const url=String((args as JSONObject).url??'');
+    if(new URL(url).protocol!=='https:')throw new Error('HTTPS_REQUIRED');
+    const navigation=name==='crawl_website'?null:await browser.navigate(url);
+    if(name==='crawl_website'){
+     const options=args as JSONObject,maxDepth=Math.max(0,Math.min(2,Number(options.maxDepth??1))),maxPages=Math.max(1,Math.min(10,Number(options.maxPages??5)));
+     const queue=[{url,depth:0}],seen=new Set<string>(),pages:JSONValue[]=[];
+     while(queue.length&&pages.length<maxPages){
+      const next=queue.shift()!;if(seen.has(next.url))continue;seen.add(next.url);
+      const nav=await browser.navigate(next.url);pages.push({...nav,text:(await browser.getText()).slice(0,16000)});
+      if(next.depth<maxDepth)for(const link of await browser.findLinks()){try{const safe=publicPageURL(link);if(new URL(safe).origin===new URL(url).origin&&!seen.has(safe)&&queue.length<100)queue.push({url:safe,depth:next.depth+1});}catch{}}
+     }
+     raw={pages,count:pages.length,maxDepth,maxPages};
+    }else if(name==='run_browser_workflow')raw=await runBrowserWorkflow(browser,workflow!);
+    else if(name==='inspect_browser_page')raw=await browser.inspect();
+    else if(name==='click_element')raw=await browser.click(String((args as JSONObject).selector));
+    else if(name==='take_screenshot')raw={screenshot:await browser.screenshot(),url:navigation!.url};
+    else if(name==='scrape_url')raw={text:(await browser.getText(String((args as JSONObject).selector??'body'))).slice(0,16000),url:navigation!.url,title:navigation!.title};
+    else raw=navigation!;
+   }finally{await browser.stop();}
+  }else if(name==='repair_source_code'){
+   const input=args as JSONObject;
+   const authorize=async()=>{
+    const {data,error}=await client.rpc('spine_lease',{p_tenant:tenant,p_mission:mission,p_owner:owner,p_release:false});
+    if(error||!data)throw new Error('REPAIR_LEASE_LOST');
+    const state=await client.from('spine_rows').select('data').eq('tenant_id',tenant).eq('mission_id',mission).eq('kind','missions').eq('id',mission).single();
+    if(state.error||!state.data||['cancelled','failed'].includes(state.data.data.status)||typeof context.constraints.deadline_at==='string'&&Date.now()>Date.parse(context.constraints.deadline_at))throw new Error('REPAIR_MISSION_STOPPED');
+   };
+   raw=JSON.parse(JSON.stringify(await repairSource(client,{tenant,mission,subtask:context.subtask_id},String(input.objective),JSON.parse(String(input.paths_json)),repairModel!,authorize)));
+  }else if(name==='run_isolated_code')raw=await runIsolatedCode(isolated!,{tenant,mission,subtask:context.subtask_id});
+  else if(name==='save_workflow_skill')raw=await saveWorkflowSkill(client,tenant,context.subtask_id,skill);
+  else if(name==='list_workflow_skills')raw=JSON.parse(JSON.stringify(await listWorkflowSkills(client,tenant)));
+  else if(name==='read_mission_artifact')raw=JSON.parse(JSON.stringify(await readMissionArtifact(client,tenant,mission,args as JSONObject)));
+  else if(name==='search_mission_history')raw=JSON.parse(JSON.stringify(await searchMissionHistory(client,tenant,mission,args as JSONObject)));
+  else if(name==='write_mission_note')raw=JSON.parse(JSON.stringify(await saveMissionNote(client,tenant,mission,owner,args as JSONObject,context)));
+  else if(name==='invoke_system_organ')raw=JSON.parse(JSON.stringify(await dispatchOrgan(String((args as JSONObject).organ_id),String((args as JSONObject).action),organPayload,tenant)));
+  else if(['search_vehicle_catalog','search_vehicle_references','obd_connection_setup','list_automotive_cases','read_automotive_case','list_obd_sessions','read_obd_status'].includes(name)){
+   raw=JSON.parse(JSON.stringify(await executeAutomotiveOrgan(tool.action,{...args as JSONObject,tenant_id:tenant},client)));
+  }
+  else if(name==='list_system_capabilities')raw=JSON.parse(JSON.stringify(systemCapabilities()));
+  else if(name==='probe_system_organ')raw=JSON.parse(JSON.stringify(await probeOrgan(String((args as JSONObject).organ_id),context.idempotency_key,tenant)));
+  else if(name==='run_live_capability_probe'){
+   const requestedMode=(args as JSONObject).mode==='deep'?'deep':'quick';
+   raw=JSON.parse(JSON.stringify(await liveCapabilityLedger.runSweep({mode:requestedMode,tenantId:tenant})));
+  }
+  else {
+   const structured=['remember_knowledge','recall_knowledge','recall_procedures'].includes(name);
+   const payload=tool.organ==='memory'?{...args as JSONObject,tenant_id:tenant,session_id:structured?`${tenant}:${mission}`:`${tenant}:tools`,event_id:context.subtask_id,tags:typeof (args as JSONObject).tags==='string'?String((args as JSONObject).tags).split(',').map(t=>t.trim()).filter(Boolean):[]}:args;
+   raw=JSON.parse(JSON.stringify(await getExecutor(tool.organ)(tool.action,payload as Record<string,unknown>))) as JSONValue;
+  }
+  }catch(error){
+   if(name!=='repair_source_code')try{await enqueueSourceIncident(client,context,error);}catch{console.error('[repair] incident queue unavailable; original failure retained');}
+   if(name==='repair_source_code'){
+    const message=error instanceof Error?error.message:'';
+    const code=/^[A-Z][A-Z0-9_]{2,100}$/.test(message)?message:error instanceof SyntaxError?'REPAIR_INVALID_MODEL_JSON':error instanceof TypeError?'REPAIR_DEPENDENCY_TYPE_ERROR':'REPAIR_EXECUTION_FAILED';
+    await rememberKnowledge(client,{tenant_id:tenant,session_id:`${tenant}:${mission}`},{kind:'project_state',scope:'session',key:`repair.${context.subtask_id}.failed`,event_id:`${context.subtask_id}:failed`,content:JSON.stringify({phase:'failed',code})});
+   }
+   if(protectedAction)throw new ExecutionPause('RECONCILIATION_REQUIRED');throw error;
+  }
+  if(raw&&typeof raw==='object'&&!Array.isArray(raw)&&('error' in raw||raw.success===false))throw new Error('TOOL_EXECUTION_FAILED');
+  const result:ExecutionResult={raw,normalized:{result:raw},evidence:{tool:name,request_hash:hash,idempotency_key:context.idempotency_key,completed_at:new Date().toISOString()}};
+  const {error:finishError}=await client.rpc('spine_finish_tool',{p_tenant:tenant,p_mission:mission,p_subtask:context.subtask_id,p_owner:owner,p_hash:hash,p_result:result});
+  if(finishError)throw new Error(finishError.code);
+  return result;
+ };
+ return {executeTool,recoverTool};
+}
+
+export function systemCapabilities(){
+ const live=liveCapabilityLedger.getSnapshot();
+ const liveByOrgan=new Map(live.records.filter(r=>r.category==='organ').map(r=>[r.id,r]));
+ return {source_repair:{provider:'render-buildkit',configured:Boolean(process.env.GITHUB_TOKEN&&process.env.MICROFIXD_REPAIR_RUNNER_URL),runner_url:process.env.MICROFIXD_REPAIR_RUNNER_URL??null,network_during_tests:'none',automatic_incident_trigger:process.env.MICROFIXD_AUTOMATIC_SOURCE_REPAIR==='1',automatic_limit_per_hour:2,automatic_limit_per_day:6},specialists:SPECIALISTS,browser_control:{supported_modes:['dom'],visual_grounding_configured:false,native_desktop_configured:false,workflow_max_actions:8,cross_call_sessions:false},isolated_sandbox:{provider:'e2b',configured:sandboxConfigured(),network_default:false,ttl_ms:120000},live_runtime:{sweep_id:live.sweepId,mode:live.mode,generated_at:live.generatedAt,stale:live.stale,counts:live.counts,subsystems:live.subsystems,summary_for_agent:live.agentSummaryPrompt},tools:TOOL_REGISTRY.map(tool=>({...tool,durable:ENABLED_TOOLS.includes(tool.name),endpoint:'/api/planner/missions',required_credentials:tool.name==='repair_source_code'?['GITHUB_TOKEN','MICROFIXD_REPAIR_RUNNER_URL']:tool.name==='run_isolated_code'?['E2B_API_KEY']:tool.organ==='github_connector'?['GITHUB_TOKEN']:[],credentials_configured:tool.name==='repair_source_code'?Boolean(process.env.GITHUB_TOKEN&&process.env.MICROFIXD_REPAIR_RUNNER_URL):tool.name==='run_isolated_code'?sandboxConfigured():tool.organ==='github_connector'?Boolean(process.env.GITHUB_TOKEN?.trim()):null})),organs:organRegistry.all().map(organ=>{const liveRec=liveByOrgan.get(organ.id);return {id:organ.id,name:organ.name,layer:organ.layer,isolated:organ.isolated,native_executor:Object.hasOwn(EXECUTORS,organ.id),live_status:organ.isolated?'isolated':(liveRec?.status??'unverified'),verification_tier:liveRec?.verificationTier??'unverified',latency_ms:liveRec?.latencyMs??null,checked_at:liveRec?.checkedAt??null,status_endpoint:`/api/organs/${organ.id}/status`,execution_endpoint:`/api/organs/${organ.id}/execute`,durable_tools:TOOL_REGISTRY.filter(tool=>tool.organ===organ.id&&ENABLED_TOOLS.includes(tool.name)).map(tool=>tool.name),note:Object.hasOwn(EXECUTORS,organ.id)?'Concrete executor; supported actions and credentials still required.':'Routing probe available; arbitrary task execution is not verified.'};})};
+}
+
+export function organInvocationPayload(args:JSONObject,tenant:string,mission:string):Record<string,unknown>{
+ const id=String(args.organ_id);
+ if(!organRegistry.get(id)||!Object.hasOwn(EXECUTORS,id))throw new Error('UNSUPPORTED_ORGAN_CAPABILITY');
+ if(['playwright','crawl_engine','github_connector','sandbox','core.tools'].includes(id))throw new Error('USE_DEDICATED_GOVERNED_TOOL');
+ const payload=JSON.parse(String(args.payload_json));
+ if(!payload||typeof payload!=='object'||Array.isArray(payload))throw new Error('INVALID_ORGAN_PAYLOAD');
+ return {...payload,tenant_id:tenant,session_id:`${tenant}:${mission}`};
+}

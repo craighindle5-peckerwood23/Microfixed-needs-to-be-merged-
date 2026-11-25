@@ -1,0 +1,16 @@
+{
+  "name": "Microfixd",
+  "description": "Governed autonomy runtime with Paragon, HITL, sandbox, memory, and multi-agent orchestration.",
+  "permissions": {
+    "health": "read",
+    "ready": "read",
+    "registry": "read",
+    "sandbox": "execute"
+  },
+  "plannedPermissions": {
+    "login": "execute",
+    "deploy": "execute",
+    "migrations": "execute"
+  },
+  "note": "plannedPermissions describe capabilities this manifest advertised but that have no backing route yet (see mcp.json notImplemented). Promote them to permissions only once the corresponding /api/deploy and /api/migrations routes are built."
+}

@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "tools": {
+    "microfixd-runtime": {
+      "type": "http",
+      "baseUrl": "https://microfixd-os-yila.onrender.com",
+      "endpoints": {
+        "health": "/health",
+        "ready": "/readyz",
+        "registry": "/api/registry",
+        "sandbox": "/api/sandbox"
+      },
+      "notImplemented": {
+        "login": "Accounts authenticate through Supabase Auth; no token-exchange endpoint is provided by this runtime.",
+        "deploy": "No /api/deploy route exists yet. Deployment today happens via Render's own build/start commands (render.yaml) triggered by a git push, not via an in-app API. Add a real route here only once an authenticated deploy-trigger endpoint is built.",
+        "migrations": "No /api/migrations route exists yet. The schema (supabase/schema.sql) is applied by hand/CI against Supabase; there is no endpoint to run or track migrations from inside the app yet."
+      }
+    }
+  }
+}

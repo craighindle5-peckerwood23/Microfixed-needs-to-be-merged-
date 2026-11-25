@@ -1,0 +1,12 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+server/hitl/data/
+server/sandbox/workspace/
+server/sandbox/session_log.jsonl
